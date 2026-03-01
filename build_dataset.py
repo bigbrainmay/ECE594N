@@ -82,3 +82,12 @@ ds = xr.Dataset(
         description="Stimulus-segmented traces",
     )
 )
+
+
+
+"""
+Example xarray usage
+ds.sel(stim=90)              # all trials, all epochs with stim=90
+ds.trace.isel(trial=0)       # first trial
+ds.trace.mean("trial")       # trial-averaged response
+"""
