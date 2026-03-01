@@ -83,11 +83,25 @@ ds = xr.Dataset(
     )
 )
 
-
+ds.to_netcdf(
+    "stim_segmented_traces.nc",
+    engine="netcdf4",   # optional but robust
+    encoding={
+        "trace": {
+            "zlib": True,
+            "complevel": 4
+        }
+    }
+)
 
 """
 Example xarray usage
 ds.sel(stim=90)              # all trials, all epochs with stim=90
 ds.trace.isel(trial=0)       # first trial
 ds.trace.mean("trial")       # trial-averaged response
+
+To load:
+import xarray as xr
+
+ds = xr.load_dataset("stim_segmented_traces.nc")
 """
