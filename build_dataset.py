@@ -2,7 +2,7 @@ import numpy as np
 import xarray as xr
 import numpy as np
 
-npz_path = "../Data/angles.npz"
+npz_path = "../Data/anglesv2.npz"
 trace_key = "traces"   # key inside the npz file
 # ---------------------
 

@@ -2,30 +2,27 @@ import scipy.io
 import numpy as np
 from scipy.interpolate import interp1d
 
-mat = scipy.io.loadmat('Liam_data.mat', simplify_cells=True)
+mat = scipy.io.loadmat('../Data/Liam_datav2.mat', simplify_cells=True)
 C = mat['C']
 
 # --- Parameters ---
-trace_type = 'fulltrace'    # 'Snips' or 'fulltrace'
+trace_type = 'Snips'    # 'Snips' or 'fulltrace'
 mode = 'grey'          # 'angle' or 'grey' (only used if trace_type == 'Snips')
 
 all_traces = []
-all_ids    = []
+all_ids    = mat['spineID'].flatten() 
 
 for recording in C:
-    d_ids = recording['dID']
 
     if trace_type == 'Snips':
         snips = recording['Snips']
-        for spine_struct, spine_id in zip(snips, d_ids):
+        for spine_struct in snips:
             trace = spine_struct['spine'][mode]
             all_traces.append(np.array(trace).flatten())
-            all_ids.append(spine_id)
     else:  # fulltrace is a 2D matrix, each row is a spine trace
         fulltrace = np.array(recording['fulltrace'])
-        for trace, spine_id in zip(fulltrace, d_ids):
+        for trace in fulltrace:
             all_traces.append(trace.flatten())
-            all_ids.append(spine_id)
 
 # Check length distribution
 lengths = [len(t) for t in all_traces]
