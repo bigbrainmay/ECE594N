@@ -8,6 +8,7 @@ trace_key = "traces"   # key inside the npz file
 
 data = np.load(npz_path)
 traces = data[trace_key]   # shape: (n_trials, total_time)
+ids = data["ids"]         # shape: (n_trials,)
 
 n_trials, total_time = traces.shape
 print(f"Loaded {n_trials} trials, each with {total_time} time points")
@@ -47,8 +48,6 @@ n_stims = len(stim_order)
 print(f"Stimulus order has {n_stims} stims")
 print(f"Remainder of total_time divided by n_stims: {total_time % n_stims}")
 
-n_trials, total_time = traces.shape
-
 stim_len = total_time // n_stims 
 
 traces_reshaped = traces.reshape(
@@ -65,7 +64,7 @@ ds = xr.Dataset(
         trial=np.arange(n_trials),
         stim_index=np.arange(n_stims),
         stim=("stim_index", stim_order),
-        time=np.arange(stim_len)
+        ids=("trial", ids)
     ),
     attrs=dict(
         description="Stimulus-segmented traces",
