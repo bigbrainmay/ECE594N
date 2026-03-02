@@ -2,135 +2,121 @@ import numpy as np
 import xarray as xr
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from sklearn.model_selection import StratifiedKFold
+import matplotlib.pyplot as plt
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 CONFIG = dict(
     # Data
     nc_path="stim_segmented_traces.nc",
     k_folds=8,
-    n_augmented_samples=96*5,    # synthetic training samples per fold (10× original 96)
+
+    # Training data mode
+    augment=False,          # False = session-averaged (clean, fast)
+                            # True  = mix-and-match augmentation
+    n_augmented_samples=960,# only used when augment=True
 
     # Architecture
-    rnn_type="RNN",             # "RNN", "LSTM", or "GRU"
-    hidden_size=32,
+    rnn_type="GRU",         # "RNN", "LSTM", or "GRU"
+    hidden_size=64,
     num_layers=1,
     dropout=0.5,
 
     # Training
     epochs=50,
     learning_rate=5e-4,
-    batch_size=32,
+    batch_size=16,
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
+ANGLE_LABELS = [str(a) + "°" for a in range(0, 360, 30)]
+
 
 # ── Data preparation ──────────────────────────────────────────────────────────
-def load_data(cfg):
-    """
-    Returns:
-        raw_traces       : (n_trials, n_stim_index, time)  — all individual trials, NOT averaged
-        stim_angles      : (n_stim_index,)                 — angle per stim_index position
-        unique_ids       : sorted array of unique spine IDs
-        spine_to_trials  : dict {spine_id: [trial_indices]}
-        n_spines         : number of unique spines
-        time             : number of time points
-    """
+def load_raw(cfg):
+    """Load all individual (non-averaged) trials. Used by both modes."""
     ds = xr.load_dataset(cfg["nc_path"])
-
-    # Drop NaN IDs
-    valid_mask = ~np.isnan(ds["ids"].values)
-    ds = ds.isel(trial=valid_mask)
-
+    valid_mask  = ~np.isnan(ds["ids"].values)
+    ds          = ds.isel(trial=valid_mask)
     raw_traces  = ds["trace"].values.astype(np.float32)  # (n_trials, stim_index, time)
     stim_angles = ds["stim"].values                       # (stim_index,)
     spine_ids   = ds["ids"].values                        # (n_trials,)
     unique_ids  = np.unique(spine_ids)
 
+    spine_to_trials = {sid: np.where(spine_ids == sid)[0] for sid in unique_ids}
     n_spines = len(unique_ids)
     time     = raw_traces.shape[2]
 
     print(f"Unique spines : {n_spines}")
     print(f"Stim positions: {len(stim_angles)}  (12 angles × 8 repeats)")
     print(f"Time points   : {time}")
-    print(f"Raw trials    : {len(spine_ids)}  (spine × session combinations)\n")
-
-    # Build lookup: spine_id → list of trial indices for that spine
-    spine_to_trials = {sid: np.where(spine_ids == sid)[0] for sid in unique_ids}
+    print(f"Raw trials    : {len(spine_ids)}")
+    print(f"Mode          : {'augmented mix-and-match' if cfg['augment'] else 'session-averaged'}\n")
 
     return raw_traces, stim_angles, unique_ids, spine_to_trials, n_spines, time
 
 
-# ── Augmented dataset ─────────────────────────────────────────────────────────
+def make_averaged_xy(raw_traces, stim_angles, unique_ids, spine_to_trials):
+    """Average sessions per spine → X: (stim_index, time, n_spines), y: (stim_index,)"""
+    n_stim   = len(stim_angles)
+    n_spines = len(unique_ids)
+    time     = raw_traces.shape[2]
+    X = np.empty((n_stim, time, n_spines), dtype=np.float32)
+    for si, sid in enumerate(unique_ids):
+        avg = raw_traces[spine_to_trials[sid]].mean(axis=0)  # (stim_index, time)
+        X[:, :, si] = avg
+    y = (stim_angles / 30).astype(np.int64)
+    return X, y
+
+
+# ── Augmented dataset (mix-and-match) ─────────────────────────────────────────
 class MixMatchDataset(Dataset):
-    """
-    Each sample is a synthetic population vector constructed by independently
-    drawing, for each spine, a random session and a random stim-index matching
-    the target angle from the training set.
-    """
     def __init__(self, raw_traces, stim_angles, unique_ids, spine_to_trials,
                  train_stim_indices, n_samples, n_classes=12):
         self.raw_traces      = raw_traces
-        self.stim_angles     = stim_angles
         self.unique_ids      = unique_ids
         self.spine_to_trials = spine_to_trials
         self.n_spines        = len(unique_ids)
         self.time            = raw_traces.shape[2]
         self.n_samples       = n_samples
         self.n_classes       = n_classes
-
-        # For each angle class, which stim_indices (repeats) are in the training set?
-        self.class_to_stim_indices = {}
+        self.class_to_stim   = {}
         for cls in range(n_classes):
-            angle         = cls * 30
-            all_for_angle = np.where(stim_angles == angle)[0]
-            available     = np.intersect1d(all_for_angle, train_stim_indices)
-            self.class_to_stim_indices[cls] = available
+            angle     = cls * 30
+            for_angle = np.where(stim_angles == angle)[0]
+            self.class_to_stim[cls] = np.intersect1d(for_angle, train_stim_indices)
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, _):
-        # Pick a random angle class
-        cls             = np.random.randint(self.n_classes)
-        available_stims = self.class_to_stim_indices[cls]
-
-        # Build population vector: (time, n_spines)
+        cls        = np.random.randint(self.n_classes)
         population = np.empty((self.time, self.n_spines), dtype=np.float32)
-        for spine_idx, sid in enumerate(self.unique_ids):
-            trial    = np.random.choice(self.spine_to_trials[sid])  # random session
-            stim_pos = np.random.choice(available_stims)            # random repeat
-            population[:, spine_idx] = self.raw_traces[trial, stim_pos, :]
-
+        for si, sid in enumerate(self.unique_ids):
+            trial    = np.random.choice(self.spine_to_trials[sid])
+            stim_pos = np.random.choice(self.class_to_stim[cls])
+            population[:, si] = self.raw_traces[trial, stim_pos, :]
         return torch.tensor(population), torch.tensor(cls, dtype=torch.long)
 
 
-# ── Real (non-augmented) test set ─────────────────────────────────────────────
-class AveragedDataset(Dataset):
-    """
-    Test set uses session-averaged traces for fair evaluation — no augmentation.
-    """
-    def __init__(self, raw_traces, stim_angles, unique_ids, spine_to_trials, stim_indices):
-        n_spines = len(unique_ids)
-        time     = raw_traces.shape[2]
-        n        = len(stim_indices)
+# ── Loader construction ───────────────────────────────────────────────────────
+def make_loaders(cfg, raw_traces, stim_angles, unique_ids, spine_to_trials,
+                 X_avg, y_avg, train_idx, test_idx):
+    test_ds     = TensorDataset(torch.tensor(X_avg[test_idx]), torch.tensor(y_avg[test_idx]))
+    test_loader = DataLoader(test_ds, batch_size=cfg["batch_size"], shuffle=False)
 
-        X = np.empty((n, time, n_spines), dtype=np.float32)
-        for spine_idx, sid in enumerate(unique_ids):
-            trial_indices = spine_to_trials[sid]
-            avg = raw_traces[trial_indices].mean(axis=0)   # (stim_index, time)
-            X[:, :, spine_idx] = avg[stim_indices, :]
+    if cfg["augment"]:
+        train_ds = MixMatchDataset(
+            raw_traces, stim_angles, unique_ids, spine_to_trials,
+            train_stim_indices=train_idx,
+            n_samples=cfg["n_augmented_samples"],
+        )
+    else:
+        train_ds = TensorDataset(torch.tensor(X_avg[train_idx]), torch.tensor(y_avg[train_idx]))
 
-        y = (stim_angles[stim_indices] / 30).astype(np.int64)
-        self.X = torch.tensor(X)
-        self.y = torch.tensor(y)
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, i):
-        return self.X[i], self.y[i]
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True)
+    return train_loader, test_loader
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -186,37 +172,90 @@ def eval_epoch(model, loader, criterion, device):
     return total_loss / n, correct / n
 
 
+@torch.no_grad()
+def collect_preds(model, loader, device):
+    model.eval()
+    all_preds, all_targets = [], []
+    for X_batch, y_batch in loader:
+        logits = model(X_batch.to(device))
+        all_preds.append(logits.argmax(1).cpu().numpy())
+        all_targets.append(y_batch.numpy())
+    return np.concatenate(all_preds), np.concatenate(all_targets)
+
+
+# ── Confusion matrix ──────────────────────────────────────────────────────────
+def plot_confusion_matrix(all_preds, all_targets, fold_accs, augment,
+                          save_path="confusion_matrix.png"):
+    n_classes = 12
+    cm = np.zeros((n_classes, n_classes), dtype=int)
+    for t, p in zip(all_targets, all_preds):
+        cm[t, p] += 1
+    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+    mode_label = "augmented" if augment else "averaged"
+    fig, axes  = plt.subplots(1, 2, figsize=(16, 6), facecolor="#0f0f0f")
+    fig.suptitle(
+        f"RNN Angle Classification ({mode_label}) — K-Fold Confusion\n"
+        f"Mean acc: {np.mean(fold_accs):.3f} ± {np.std(fold_accs):.3f}  |  Chance: {1/12:.3f}",
+        color="white", fontsize=13, y=1.01
+    )
+
+    for ax, data, title, fmt in [
+        (axes[0], cm_norm, "Normalized (row %)", ".2f"),
+        (axes[1], cm,      "Raw counts",         "d"),
+    ]:
+        ax.set_facecolor("#0f0f0f")
+        im = ax.imshow(data, cmap="magma", aspect="auto",
+                       vmin=0, vmax=(1.0 if fmt == ".2f" else None))
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.yaxis.set_tick_params(color="white")
+
+        for i in range(n_classes):
+            for j in range(n_classes):
+                val        = data[i, j]
+                text       = f"{val:.2f}" if fmt == ".2f" else f"{val:d}"
+                brightness = val / (data.max() + 1e-8)
+                color      = "white" if brightness < 0.6 else "black"
+                ax.text(j, i, text, ha="center", va="center", fontsize=7, color=color)
+
+        ax.set_xticks(range(n_classes))
+        ax.set_yticks(range(n_classes))
+        ax.set_xticklabels(ANGLE_LABELS, rotation=45, ha="right", color="white", fontsize=8)
+        ax.set_yticklabels(ANGLE_LABELS, color="white", fontsize=8)
+        ax.set_xlabel("Predicted angle", color="white", fontsize=10)
+        ax.set_ylabel("True angle",      color="white", fontsize=10)
+        ax.set_title(title, color="#aaaaaa", fontsize=10, pad=8)
+        ax.tick_params(colors="white")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#444444")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"Confusion matrix saved to {save_path}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main(cfg=CONFIG):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
-    raw_traces, stim_angles, unique_ids, spine_to_trials, n_spines, time = load_data(cfg)
+    raw_traces, stim_angles, unique_ids, spine_to_trials, n_spines, time = load_raw(cfg)
+    X_avg, y_avg = make_averaged_xy(raw_traces, stim_angles, unique_ids, spine_to_trials)
 
-    # K-fold split over the 96 stim positions (stratified by angle)
-    stim_indices = np.arange(len(stim_angles))
-    y_stim       = (stim_angles / 30).astype(np.int64)
-    skf          = StratifiedKFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
-    criterion    = nn.CrossEntropyLoss()
+    skf            = StratifiedKFold(n_splits=cfg["k_folds"], shuffle=True, random_state=42)
+    criterion      = nn.CrossEntropyLoss()
     fold_best_accs = []
+    all_preds, all_targets = [], []
 
-    for fold, (train_stim_idx, test_stim_idx) in enumerate(skf.split(stim_indices, y_stim), 1):
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X_avg, y_avg), 1):
         print(f"{'─'*60}")
-        print(f"Fold {fold}/{cfg['k_folds']}  |  "
-              f"train stim positions: {len(train_stim_idx)}  "
-              f"test: {len(test_stim_idx)}")
+        print(f"Fold {fold}/{cfg['k_folds']}  |  train: {len(train_idx)}  test: {len(test_idx)}")
         print(f"{'─'*60}")
 
-        train_ds = MixMatchDataset(
-            raw_traces, stim_angles, unique_ids, spine_to_trials,
-            train_stim_idx, n_samples=cfg["n_augmented_samples"]
+        train_loader, test_loader = make_loaders(
+            cfg, raw_traces, stim_angles, unique_ids, spine_to_trials,
+            X_avg, y_avg, train_idx, test_idx
         )
-        test_ds = AveragedDataset(
-            raw_traces, stim_angles, unique_ids, spine_to_trials, test_stim_idx
-        )
-
-        train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True)
-        test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"], shuffle=False)
 
         model = AngleRNN(
             input_size=n_spines,
@@ -231,15 +270,19 @@ def main(cfg=CONFIG):
             optimizer, mode="max", patience=5, factor=0.5
         )
 
-        best_acc = 0.0
+        # Save state from epoch 1 unconditionally to avoid None on load
+        best_acc   = -1.0
+        best_state = None
+
         for epoch in range(1, cfg["epochs"] + 1):
             train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
             test_loss,  test_acc  = eval_epoch(model, test_loader,  criterion, device)
             scheduler.step(test_acc)
 
             if test_acc > best_acc:
-                best_acc = test_acc
-                torch.save(model.state_dict(), f"best_rnn_fold{fold}.pt")
+                best_acc   = test_acc
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                torch.save(best_state, f"best_rnn_fold{fold}.pt")
 
             print(
                 f"  Epoch {epoch:03d}/{cfg['epochs']} | "
@@ -248,16 +291,28 @@ def main(cfg=CONFIG):
                 + (" ✓" if test_acc == best_acc else "")
             )
 
+        model.load_state_dict(best_state)
+        preds, targets = collect_preds(model, test_loader, device)
+        all_preds.append(preds)
+        all_targets.append(targets)
         fold_best_accs.append(best_acc)
         print(f"  → Best acc this fold: {best_acc:.3f}\n")
 
     print(f"{'═'*60}")
-    print(f"K-Fold Results ({cfg['k_folds']} folds)")
+    print(f"K-Fold Results ({cfg['k_folds']} folds) — {'augmented' if cfg['augment'] else 'averaged'}")
     print(f"{'═'*60}")
     for i, acc in enumerate(fold_best_accs, 1):
         print(f"  Fold {i}: {acc:.3f}")
     print(f"  Mean ± Std: {np.mean(fold_best_accs):.3f} ± {np.std(fold_best_accs):.3f}")
     print(f"  Chance level: {1/12:.3f}")
+
+    plot_confusion_matrix(
+        np.concatenate(all_preds),
+        np.concatenate(all_targets),
+        fold_best_accs,
+        augment=cfg["augment"],
+        save_path="confusion_matrix.png"
+    )
 
 
 if __name__ == "__main__":
